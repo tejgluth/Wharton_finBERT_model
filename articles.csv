@@ -1,0 +1,5 @@
+doc_id,symbol,text,article_type,section_key
+a1,AAPL,"Apple reported strong iPhone sales this quarter.",tier1_news,
+a2,AAPL,"In Item 7 MD&A, Apple discussed supply chain risks.",reports,mdna_weight
+a3,MSFT,"Microsoft announced new AI initiatives boosting confidence.",news_blogs,
+a4,MSFT,"Microsoft filed its quarterly 10-Q with stable revenue growth.",reports,risk_weight
