@@ -84,20 +84,19 @@ class FinBertScorer:
 # -------------------------
 # Per-doc scoring
 # -------------------------
-def per_doc_weighted_score(row: pd.Series,
-                           finbert_score: float,
-                           type_weights: Dict[str, float],
-                           section_weights: Dict[str, float]) -> float:
-    # base sentiment from FinBERT
+def per_doc_weighted_score(
+    article_type: str,
+    section_key: Optional[str],
+    finbert_score: float,
+    type_weights: Dict[str, float],
+    section_weights: Dict[str, float],
+) -> float:
     u = finbert_score  # already in [-1, 1]
+    if section_key and section_key in section_weights:
+        u *= float(section_weights[section_key])
 
-    # section weight (optional)
-    if pd.notnull(row.get("section_key")) and row["section_key"] in section_weights:
-        u *= float(section_weights[row["section_key"]])
-
-    # article type / stratum weight (required)
-    atype = str(row["article_type"]).strip()
-    w = float(type_weights.get(atype, 0.0))  # default 0 if unknown type
+    atype = (article_type or "").strip()
+    w = float(type_weights.get(atype, 0.0))  # default 0 if unknown
     return w * u
 
 # -------------------------
@@ -166,9 +165,16 @@ def main(args):
     section_weights = cfg.get("section_weights", {})
     df["_finbert"] = s_fin
     df["_weighted"] = [
-        per_doc_weighted_score(row, score, type_weights, section_weights)
-        for row, score in zip(df.itertuples(index=False), s_fin)
+    per_doc_weighted_score(
+        article_type=getattr(row, "article_type"),
+        section_key=getattr(row, "section_key", None),  # safe even if column missing
+        finbert_score=score,
+        type_weights=type_weights,
+        section_weights=section_weights,
+    )
+    for row, score in zip(df.itertuples(index=False), s_fin)
     ]
+
 
     # Aggregate per symbol
     out_rows = []
