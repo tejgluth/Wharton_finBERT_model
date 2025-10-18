@@ -16,7 +16,7 @@ source Wharton_env/bin/activate
 ### 2. Install dependencies
 ```bash
 pip install --upgrade pip
-pip install pandas numpy transformers torch pyyaml
+pip install pandas numpy transformers torch pyyaml requests tqdm
 ```
 > **Note:** The first run downloads the FinBERT model (~400–500 MB).
 
@@ -81,6 +81,27 @@ Typical columns:
 - 1.0+ → strong tilt
 
 If the β confidence interval crosses 0, the direction is inconclusive with the current documents.
+
+## Collecting Articles with GDELT Doc 2.0
+
+Use `fetch_finnews.py` to pull recent articles for a ticker list and map each source domain to a tier weight. The script ships with sensible defaults embedded directly in the code (see `DEFAULT_TIERS_CFG` inside `fetch_finnews.py`).
+
+```bash
+python fetch_finnews.py \
+  --tickers tickers.csv \
+  --out data/news_harvest.csv \
+  --maxrecords 250
+```
+
+Where `tickers.csv` contains:
+
+```csv
+symbol,company
+AAPL,Apple Inc.
+MSFT,Microsoft Corporation
+```
+
+Each harvested row includes `doc_id`, `symbol`, `title`, `url`, `source_domain`, `published_at`, `article_type`, `tier_weight`, and a placeholder `text` column (currently populated with the GDELT snippet). Update the domain tiers by editing the `DEFAULT_TIERS_CFG` dictionary if you need to change weights or add publishers.
 
 ## Optional Configuration (`weights.yaml`)
 ```yaml
