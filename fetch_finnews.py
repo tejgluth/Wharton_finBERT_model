@@ -7,7 +7,7 @@ import hashlib
 import logging
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urlunparse
 
 import requests
 
@@ -126,6 +126,28 @@ def _wrap_clause(clause: str) -> str:
     if " OR " in clause:
         return f"({clause})"
     return clause
+
+
+def _canonicalize_url(url: str) -> str:
+    """Return a best-effort canonical URL for duplicate detection."""
+
+    if not isinstance(url, str) or not url:
+        return ""
+    parsed = urlparse(url.strip())
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path or "/"
+    if path != "/":
+        path = path.rstrip("/") or "/"
+    canonical = parsed._replace(
+        scheme=scheme,
+        netloc=netloc,
+        path=path,
+        params="",
+        query="",
+        fragment="",
+    )
+    return urlunparse(canonical)
 
 
 DEFAULT_TIERS_CFG: Dict[str, Dict[str, object]] = {
@@ -397,7 +419,7 @@ def harvest(
         {domain for tier in tiers_cfg.values() for domain in tier.get("domains", [])}
     )
     rows: List[Dict[str, object]] = []
-    seen_ids = set()
+    seen_urls = set()
 
     for ticker, company in companies:
         domain_chunks = chunk_domains(company, ticker, all_domains)
@@ -442,12 +464,14 @@ def harvest(
                 url = article.get("url") or article.get("documentIdentifier")
                 if not url:
                     continue
+                canonical_url = _canonicalize_url(url)
+                dedupe_key = canonical_url or url
                 domain = article.get("sourceDomain")
                 if not domain:
                     parsed = urlparse(url)
                     domain = parsed.netloc
                 tier_name, weight = tier_for_domain(domain, tiers_cfg)
-                doc_id = hashlib.sha256(url.encode("utf-8")).hexdigest()
+                doc_id = hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()
                 published = article.get("seendate") or article.get("publishedDate")
                 if (
                     isinstance(published, str)
@@ -459,9 +483,9 @@ def harvest(
                         f"{published[0:4]}-{published[4:6]}-{published[6:8]} "
                         f"{published[8:10]}:{published[10:12]}:{published[12:14]}"
                     )
-                if doc_id in seen_ids:
+                if dedupe_key in seen_urls:
                     continue
-                seen_ids.add(doc_id)
+                seen_urls.add(dedupe_key)
                 rows.append(
                     {
                         "doc_id": doc_id,
