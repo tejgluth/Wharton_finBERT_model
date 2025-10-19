@@ -25,6 +25,14 @@ DEFAULT_CFG = {
         "tier1_news": 0.75,
         "news_blogs": 0.45,
         "social": 0.15,
+        # support fetch_finnews tiers
+        "professional": 1.0,
+        "semi": 0.65,
+        "low": 0.2,
+        # snippet-specific kinds
+        "headline": 0.75,
+        "paragraph": 0.65,
+        "sentence": 0.5,
     },
     # optional section weights if you chunk filings
     "section_weights": {
