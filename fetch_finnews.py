@@ -6,10 +6,12 @@ import csv
 import hashlib
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode, urlparse, urlunparse
 
 import requests
+import trafilatura
+import re
 
 
 GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -148,6 +150,50 @@ def _canonicalize_url(url: str) -> str:
         fragment="",
     )
     return urlunparse(canonical)
+
+
+def _extract_article_text(url: str) -> Optional[str]:
+    """Fetch and extract article text using trafilatura."""
+
+    if not url:
+        return None
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            raise RuntimeError("No content fetched")
+    except Exception as exc:  # pragma: no cover - network dependent
+        logging.debug("trafilatura.fetch_url failed for %s: %s", url, exc)
+        try:
+            response = requests.get(url, headers=REQUEST_HEADERS, timeout=30)
+            response.raise_for_status()
+            downloaded = response.text
+        except Exception as req_exc:  # pragma: no cover - network dependent
+            logging.debug("Fallback fetch failed for %s: %s", url, req_exc)
+            return None
+
+    try:
+        text = trafilatura.extract(
+            downloaded,
+            include_comments=False,
+            include_tables=False,
+            include_formatting=False,
+        )
+        if text:
+            return text.strip()
+    except Exception as exc:  # pragma: no cover - network dependent
+        logging.debug("trafilatura.extract failed for %s: %s", url, exc)
+    return None
+
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _clean_text(text: Optional[str]) -> str:
+    """Collapse whitespace so CSV rows remain single-line."""
+
+    if not text:
+        return ""
+    return _WHITESPACE_RE.sub(" ", text).strip()
 
 
 DEFAULT_TIERS_CFG: Dict[str, Dict[str, object]] = {
@@ -420,6 +466,7 @@ def harvest(
     )
     rows: List[Dict[str, object]] = []
     seen_urls = set()
+    content_cache: Dict[str, Optional[str]] = {}
 
     for ticker, company in companies:
         domain_chunks = chunk_domains(company, ticker, all_domains)
@@ -485,7 +532,18 @@ def harvest(
                     )
                 if dedupe_key in seen_urls:
                     continue
+                if dedupe_key in content_cache:
+                    article_text = content_cache[dedupe_key]
+                else:
+                    article_text = _extract_article_text(url)
+                    content_cache[dedupe_key] = article_text
                 seen_urls.add(dedupe_key)
+                clean_text = _clean_text(article_text)
+                if not clean_text:
+                    clean_text = _clean_text(article.get("snippet"))
+                if not clean_text:
+                    logging.debug("Skipping %s due to empty content", url)
+                    continue
                 rows.append(
                     {
                         "doc_id": doc_id,
@@ -496,7 +554,7 @@ def harvest(
                         "published_at": published,
                         "article_type": tier_name,
                         "tier_weight": weight,
-                        "text": article.get("snippet"),
+                        "text": clean_text,
                     }
                 )
     return rows
