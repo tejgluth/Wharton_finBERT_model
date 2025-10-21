@@ -45,11 +45,88 @@ DEFAULT_CFG = {
 # -------------------------
 # Utils
 # -------------------------
+CAP_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "large": {"reports": 0.9, "news": 0.1, "other": 0.0},
+    "mid": {"reports": 0.7, "news": 0.2, "other": 0.1},
+    "small": {"reports": 0.5, "news": 0.3, "other": 0.2},
+}
+
+CAP_NORMALISER = {
+    "l": "large",
+    "large-cap": "large",
+    "large cap": "large",
+    "megacap": "large",
+    "mega": "large",
+    "m": "mid",
+    "mid-cap": "mid",
+    "mid cap": "mid",
+    "medium": "mid",
+    "s": "small",
+    "small-cap": "small",
+    "small cap": "small",
+}
+
+
 def set_seeds(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def normalise_cap(value: Optional[str], default: str) -> str:
+    if not value:
+        return default
+    val = value.strip().lower()
+    if val in CAP_WEIGHTS:
+        return val
+    return CAP_NORMALISER.get(val, default)
+
+
+def parse_cap_map(mapping: str, default: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not mapping:
+        return out
+    for pair in mapping.split(";"):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        sym, cap = pair.split(":", 1)
+        sym = sym.strip().upper()
+        if not sym:
+            continue
+        out[sym] = normalise_cap(cap, default)
+    return out
+
+
+def bucket_for_article(article_type: Optional[str], snippet_kind: Optional[str], tier_weight: Optional[float]) -> str:
+    atype = (article_type or "").strip().lower()
+    skind = (snippet_kind or "").strip().lower()
+    try:
+        weight = float(tier_weight) if tier_weight is not None else None
+    except Exception:
+        weight = None
+
+    if atype in {"reports", "filing"}:
+        return "reports"
+    if atype in {"professional", "tier1_news"}:
+        return "reports"
+    if atype in {"semi", "news_blogs"}:
+        return "news"
+    if atype in {"low", "social"}:
+        return "other"
+
+    if skind in {"headline", "paragraph"}:
+        return "news"
+    if skind in {"sentence"}:
+        return "news"
+
+    if weight is not None:
+        if weight >= 0.9:
+            return "reports"
+        if weight >= 0.5:
+            return "news"
+    return "other"
 
 def log_signed(qrs: float) -> float:
     """Symmetric, stable log transform."""
@@ -68,7 +145,7 @@ class FinBertScorer:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.max_seq_len = max_seq_len
-        # Most FinBERT variants use label order: [negative, neutral, positive]
+        # FinBERT (ProsusAI) label order is [positive, negative, neutral]
 
     @torch.no_grad()
     def score_texts(self, texts: List[str], batch_size: int = 16) -> np.ndarray:
@@ -84,8 +161,11 @@ class FinBertScorer:
             ).to(self.device)
             logits = self.model(**tok).logits
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
+            # FinBERT label order (id2label) is {0: positive, 1: negative, 2: neutral}
             # Map to scalar in [-1,1]: P(pos) - P(neg)
-            s = probs[:, 2] - probs[:, 0]
+            pos = probs[:, 0]
+            neg = probs[:, 1]
+            s = pos - neg
             out.extend(s.tolist())
         return np.array(out)
 
@@ -173,25 +253,60 @@ def main(args):
     section_weights = cfg.get("section_weights", {})
     df["_finbert"] = s_fin
     df["_weighted"] = [
-    per_doc_weighted_score(
-        article_type=getattr(row, "article_type"),
-        section_key=getattr(row, "section_key", None),  # safe even if column missing
-        finbert_score=score,
-        type_weights=type_weights,
-        section_weights=section_weights,
-    )
-    for row, score in zip(df.itertuples(index=False), s_fin)
+        per_doc_weighted_score(
+            article_type=getattr(row, "article_type"),
+            section_key=getattr(row, "section_key", None),  # safe even if column missing
+            finbert_score=score,
+            type_weights=type_weights,
+            section_weights=section_weights,
+        )
+        for row, score in zip(df.itertuples(index=False), s_fin)
     ]
+
+    # Market-cap categories
+    default_cap = normalise_cap(args.cap_default, "large")
+    cap_map_cli = parse_cap_map(args.cap_map, default_cap)
+    cap_column = None
+    for candidate in ("market_cap_category", "market_cap", "cap_category"):
+        if candidate in df.columns:
+            cap_column = candidate
+            break
+
+    if cap_column:
+        df["_cap_category"] = df[cap_column].apply(lambda val: normalise_cap(str(val) if val is not None else "", default_cap))
+    else:
+        df["_cap_category"] = df["symbol"].apply(lambda sym: cap_map_cli.get(str(sym).upper(), default_cap))
+
+    # Determine article bucket (reports/news/other)
+    def determine_bucket(row) -> str:
+        return bucket_for_article(
+            getattr(row, "article_type", None),
+            getattr(row, "snippet_kind", None),
+            getattr(row, "tier_weight", None),
+        )
+
+    df["_bucket"] = [determine_bucket(row) for row in df.itertuples(index=False)]
+
+    df["_cap_coeff"] = [
+        CAP_WEIGHTS.get(cap, CAP_WEIGHTS[default_cap]).get(bucket, 0.0)
+        for cap, bucket in zip(df["_cap_category"], df["_bucket"])
+    ]
+
+    df["_weighted_final"] = df["_weighted"] * df["_cap_coeff"]
 
 
     # Aggregate per symbol
     out_rows = []
     for sym, g in df.groupby("symbol"):
-        vals = g["_weighted"].to_numpy(dtype=float)
-        # Raw QRS (sum)
-        qrs = float(vals.sum())
-        # Bootstrap for CI
-        boots = bootstrap_sum(vals, n_reps=int(cfg["bootstrap_replicates"]), seed=int(cfg["random_seed"]))
+        cap_cat = g["_cap_category"].mode().iat[0] if not g["_cap_category"].empty else default_cap
+        bucket_scores = g.groupby("_bucket")["_weighted"].sum()
+        vals_final = g["_weighted_final"].to_numpy(dtype=float)
+        vals_raw = g["_weighted"].to_numpy(dtype=float)
+
+        qrs = float(vals_final.sum())
+        qrs_raw = float(vals_raw.sum())
+
+        boots = bootstrap_sum(vals_final, n_reps=int(cfg["bootstrap_replicates"]), seed=int(cfg["random_seed"]))
         qrs_mean = float(boots.mean())
         qrs_lo, qrs_hi = np.percentile(boots, [2.5, 97.5])
 
@@ -204,6 +319,7 @@ def main(args):
         out_rows.append({
             "symbol": sym,
             "n_docs": int(len(g)),
+            "market_cap_category": cap_cat,
             "qrs": qrs,
             "qrs_mean_boot": qrs_mean,
             "qrs_ci_lo": float(qrs_lo),
@@ -212,6 +328,10 @@ def main(args):
             "beta_mean_boot": beta_mean,
             "beta_ci_lo": beta_lo,
             "beta_ci_hi": beta_hi,
+            "reports_score": float(bucket_scores.get("reports", 0.0)),
+            "news_score": float(bucket_scores.get("news", 0.0)),
+            "other_score": float(bucket_scores.get("other", 0.0)),
+            "qrs_unweighted": qrs_raw,
         })
 
     out = pd.DataFrame(out_rows).sort_values("beta", ascending=False)
@@ -232,4 +352,6 @@ if __name__ == "__main__":
     p.add_argument("--symbol", default=None, help="Optional ticker filter (e.g., AAPL)")
     p.add_argument("--config", default=None, help="Optional YAML to override defaults")
     p.add_argument("--output", default=None, help="Optional CSV/Parquet for scores")
+    p.add_argument("--cap-map", default="", help="Optional symbol:cap mapping (large/mid/small, e.g. 'AAPL:large;TSLA:mid')")
+    p.add_argument("--cap-default", default="large", help="Default market cap category when unspecified")
     main(p.parse_args())
