@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 import random
+from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -145,6 +146,9 @@ class FinBertScorer:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.max_seq_len = max_seq_len
+        self.device_type = "cuda" if self.device.startswith("cuda") else "cpu"
+        self.autocast_enabled = self.device_type == "cuda"
+        self.autocast_dtype = torch.float16 if self.autocast_enabled else torch.float32
         # FinBERT (ProsusAI) label order is [positive, negative, neutral]
 
     @torch.no_grad()
@@ -159,7 +163,13 @@ class FinBertScorer:
                 max_length=self.max_seq_len,
                 return_tensors="pt"
             ).to(self.device)
-            logits = self.model(**tok).logits
+            autocast_ctx = (
+                torch.autocast(device_type=self.device_type, dtype=self.autocast_dtype)
+                if self.autocast_enabled
+                else nullcontext()
+            )
+            with autocast_ctx:
+                logits = self.model(**tok).logits
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             # FinBERT label order (id2label) is {0: positive, 1: negative, 2: neutral}
             # Map to scalar in [-1,1]: P(pos) - P(neg)

@@ -16,7 +16,9 @@ source Wharton_env/bin/activate
 ### 2. Install dependencies
 ```bash
 pip install --upgrade pip
-pip install pandas numpy transformers torch pyyaml requests tqdm
+pip install pandas numpy transformers torch pyyaml requests tqdm trafilatura
+# optional: faster sentence splits
+# pip install blingfire
 ```
 > **Note:** The first run downloads the FinBERT model (~400–500 MB).
 
@@ -27,9 +29,11 @@ pip install pandas numpy transformers torch pyyaml requests tqdm
    python fetch_finnews.py \
      --tickers tickers.csv \
      --out articles.csv \
-     --maxrecords 250
+     --maxrecords 250 \
+     --maxarticles 500 \
+     --sleep 1.0
    ```
-   The output file keeps only rows with non-empty article text and adds source-specific tier weights (`professional`, `semi`, `low`).
+   The output file keeps only rows with non-empty article text and adds source-specific tier weights (`professional`, `semi`, `low`). `--maxarticles` keeps paging backwards in time until roughly that many articles per ticker are retrieved (Doc 2.0 still caps each call at 250 results, but the harvester keeps requesting older windows). Use `--sleep` (seconds) to throttle between requests, and `--shard-index/--shard-count` if you want to run multiple harvesters in parallel (e.g., shard index 0 of 4, 1 of 4, etc.).
 
 2. **Generate snippet-level training/evaluation units** that explicitly mention each ticker/company:
    ```bash

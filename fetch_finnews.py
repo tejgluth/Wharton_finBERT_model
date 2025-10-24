@@ -5,6 +5,8 @@ import argparse
 import csv
 import hashlib
 import logging
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlencode, urlparse, urlunparse
@@ -184,6 +186,35 @@ def _extract_article_text(url: str) -> Optional[str]:
         logging.debug("trafilatura.extract failed for %s: %s", url, exc)
     return None
 
+
+def _parse_gdelt_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip()
+    try:
+        if len(s) == 14 and s.isdigit():
+            return datetime.strptime(s, "%Y%m%d%H%M%S")
+        if len(s) == 15 and s.endswith("Z") and "T" in s:
+            return datetime.strptime(s, "%Y%m%dT%H%M%SZ")
+        if s.endswith("Z"):
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+            except ValueError:
+                pass
+        if "T" in s:
+            try:
+                return datetime.fromisoformat(s)
+            except ValueError:
+                pass
+        if " " in s:
+            return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return None
+
+
+def _format_enddatetime(dt: datetime) -> str:
+    return dt.strftime("%Y%m%d%H%M%S")
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -432,7 +463,12 @@ def chunk_domains(
     return chunks
 
 
-def gdelt_search(query: str, maxrecords: int = 250) -> List[Dict[str, object]]:
+def gdelt_search(
+    query: str,
+    maxrecords: int = 250,
+    enddatetime: Optional[str] = None,
+    startdatetime: Optional[str] = None,
+) -> List[Dict[str, object]]:
     """Execute a query against the GDELT Doc 2.0 API."""
     params = {
         "query": query,
@@ -441,6 +477,10 @@ def gdelt_search(query: str, maxrecords: int = 250) -> List[Dict[str, object]]:
         "maxrecords": str(maxrecords),
         "sort": "DateDesc",
     }
+    if enddatetime:
+        params["enddatetime"] = enddatetime
+    if startdatetime:
+        params["startdatetime"] = startdatetime
     response = requests.get(
         GDELT_ENDPOINT, params=params, headers=REQUEST_HEADERS, timeout=30
     )
@@ -459,6 +499,9 @@ def harvest(
     companies: Sequence[Tuple[str, str]],
     tiers_cfg: Dict[str, Dict[str, object]],
     maxrecords: int = 250,
+    maxarticles: Optional[int] = None,
+    sleep_between: float = 0.0,
+    days_step: int = 30,
 ) -> List[Dict[str, object]]:
     """Harvest articles for a list of (ticker, company_name)."""
     all_domains = sorted(
@@ -483,7 +526,13 @@ def harvest(
                 query_plan.append((domain_chunk, keyword_chunk))
 
         total_queries = len(query_plan)
+        ticker_start = len(rows)
+        target = maxarticles
+        ticker_complete = False
+
         for idx, (domain_chunk, keyword_chunk) in enumerate(query_plan, start=1):
+            if ticker_complete:
+                break
             query = build_query(
                 company,
                 ticker,
@@ -501,62 +550,108 @@ def harvest(
                 query,
                 _encoded_query_length(query),
             )
-            try:
-                articles = gdelt_search(query, maxrecords=maxrecords)
-            except Exception as exc:  # pragma: no cover - network error
-                logging.error("Failed to query GDELT for %s: %s", ticker, exc)
-                continue
 
-            for article in articles:
-                url = article.get("url") or article.get("documentIdentifier")
-                if not url:
-                    continue
-                canonical_url = _canonicalize_url(url)
-                dedupe_key = canonical_url or url
-                domain = article.get("sourceDomain")
-                if not domain:
-                    parsed = urlparse(url)
-                    domain = parsed.netloc
-                tier_name, weight = tier_for_domain(domain, tiers_cfg)
-                doc_id = hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()
-                published = article.get("seendate") or article.get("publishedDate")
-                if (
-                    isinstance(published, str)
-                    and len(published) == 14
-                    and published.isdigit()
-                ):
-                    # GDELT seendate format YYYYMMDDHHMMSS
-                    published = (
-                        f"{published[0:4]}-{published[4:6]}-{published[6:8]} "
-                        f"{published[8:10]}:{published[10:12]}:{published[12:14]}"
+            end_dt: Optional[datetime] = None
+            while True:
+                end_param = _format_enddatetime(end_dt) if end_dt else None
+                start_param = None
+                if end_dt:
+                    start_dt = end_dt - timedelta(days=days_step)
+                    start_param = _format_enddatetime(start_dt)
+                try:
+                    articles = gdelt_search(
+                        query,
+                        maxrecords=maxrecords,
+                        enddatetime=end_param,
+                        startdatetime=start_param,
                     )
-                if dedupe_key in seen_urls:
-                    continue
-                if dedupe_key in content_cache:
-                    article_text = content_cache[dedupe_key]
-                else:
-                    article_text = _extract_article_text(url)
-                    content_cache[dedupe_key] = article_text
-                seen_urls.add(dedupe_key)
-                clean_text = _clean_text(article_text)
-                if not clean_text:
-                    clean_text = _clean_text(article.get("snippet"))
-                if not clean_text:
-                    logging.debug("Skipping %s due to empty content", url)
-                    continue
-                rows.append(
-                    {
-                        "doc_id": doc_id,
-                        "symbol": ticker,
-                        "title": article.get("title"),
-                        "url": url,
-                        "source_domain": domain,
-                        "published_at": published,
-                        "article_type": tier_name,
-                        "tier_weight": weight,
-                        "text": clean_text,
-                    }
-                )
+                except Exception as exc:  # pragma: no cover - network error
+                    logging.error("Failed to query GDELT for %s: %s", ticker, exc)
+                    break
+
+                if not articles:
+                    break
+
+                min_seen_dt: Optional[datetime] = None
+                new_rows = 0
+
+                for article in articles:
+                    url = article.get("url") or article.get("documentIdentifier")
+                    if not url:
+                        continue
+                    canonical_url = _canonicalize_url(url)
+                    dedupe_key = canonical_url or url
+                    if dedupe_key in seen_urls:
+                        continue
+
+                    domain = article.get("sourceDomain")
+                    if not domain:
+                        parsed = urlparse(url)
+                        domain = parsed.netloc
+                    tier_name, weight = tier_for_domain(domain, tiers_cfg)
+
+                    doc_id = hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()
+
+                    raw_published = article.get("seendate") or article.get("publishedDate")
+                    parsed_dt = _parse_gdelt_datetime(raw_published)
+                    if parsed_dt and (min_seen_dt is None or parsed_dt < min_seen_dt):
+                        min_seen_dt = parsed_dt
+
+                    published = raw_published
+                    if (
+                        isinstance(published, str)
+                        and len(published) == 14
+                        and published.isdigit()
+                    ):
+                        published = (
+                            f"{published[0:4]}-{published[4:6]}-{published[6:8]} "
+                            f"{published[8:10]}:{published[10:12]}:{published[12:14]}"
+                        )
+
+                    if dedupe_key in content_cache:
+                        article_text = content_cache[dedupe_key]
+                    else:
+                        article_text = _extract_article_text(url)
+                        content_cache[dedupe_key] = article_text
+
+                    clean_text = _clean_text(article_text)
+                    if not clean_text:
+                        clean_text = _clean_text(article.get("snippet"))
+                    if not clean_text:
+                        logging.debug("Skipping %s due to empty content", url)
+                        continue
+
+                    seen_urls.add(dedupe_key)
+                    rows.append(
+                        {
+                            "doc_id": doc_id,
+                            "symbol": ticker,
+                            "title": article.get("title"),
+                            "url": url,
+                            "source_domain": domain,
+                            "published_at": published,
+                            "article_type": tier_name,
+                            "tier_weight": weight,
+                            "text": clean_text,
+                        }
+                    )
+                    new_rows += 1
+
+                    if target and (len(rows) - ticker_start) >= target:
+                        ticker_complete = True
+                        break
+
+                if ticker_complete or not new_rows:
+                    break
+
+                if not min_seen_dt:
+                    break
+
+                end_dt = min_seen_dt - timedelta(seconds=1)
+
+                if sleep_between > 0:
+                    time.sleep(sleep_between)
+
     return rows
 
 
@@ -603,6 +698,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tickers", required=True, help="CSV with symbol,company columns")
     parser.add_argument("--out", required=True, help="Destination CSV path for harvested data")
     parser.add_argument("--maxrecords", type=int, default=250, help="Max records per ticker query")
+    parser.add_argument("--maxarticles", type=int, default=None, help="Approximate max articles per ticker (fetches in batches)")
+    parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between API calls (helps avoid throttling)")
+    parser.add_argument("--days-step", type=int, default=30, help="Days to step backwards when paginating")
+    parser.add_argument("--shard-index", type=int, default=None, help="Zero-based shard index for parallel harvesting")
+    parser.add_argument("--shard-count", type=int, default=None, help="Total number of shards for parallel harvesting")
     parser.add_argument("--log", default="INFO", help="Logging level")
     return parser.parse_args(argv)
 
@@ -612,7 +712,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     logging.basicConfig(level=getattr(logging, args.log.upper(), logging.INFO))
     tiers_cfg = load_domains()
     companies = read_companies(args.tickers)
-    rows = harvest(companies, tiers_cfg, maxrecords=args.maxrecords)
+
+    if (args.shard_index is None) ^ (args.shard_count is None):
+        raise ValueError("--shard-index and --shard-count must be provided together")
+    if args.shard_count is not None:
+        if args.shard_count <= 0:
+            raise ValueError("--shard-count must be positive")
+        if not (0 <= args.shard_index < args.shard_count):
+            raise ValueError("--shard-index must be in [0, shard-count)")
+        shard_companies = [c for idx, c in enumerate(companies) if idx % args.shard_count == args.shard_index]
+        logging.info("Processing shard %d/%d (%d tickers)", args.shard_index + 1, args.shard_count, len(shard_companies))
+        companies = shard_companies
+
+    rows = harvest(
+        companies,
+        tiers_cfg,
+        maxrecords=args.maxrecords,
+        maxarticles=args.maxarticles,
+        sleep_between=args.sleep,
+        days_step=args.days_step,
+    )
     save_csv(rows, args.out)
     if rows:
         logging.info("Saved %d rows to %s", len(rows), args.out)
