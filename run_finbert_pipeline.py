@@ -127,6 +127,7 @@ def bucket_for_article(article_type: Optional[str], snippet_kind: Optional[str],
             return "reports"
         if weight >= 0.5:
             return "news"
+        return "other"
     return "other"
 
 def log_signed(qrs: float) -> float:
@@ -329,6 +330,7 @@ def main(args):
         out_rows.append({
             "symbol": sym,
             "n_docs": int(len(g)),
+            "n_snippets": int(len(g)),
             "market_cap_category": cap_cat,
             "qrs": qrs,
             "qrs_mean_boot": qrs_mean,

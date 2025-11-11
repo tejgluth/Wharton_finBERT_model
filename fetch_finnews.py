@@ -235,23 +235,32 @@ DEFAULT_TIERS_CFG: Dict[str, Dict[str, object]] = {
             "wsj.com",
             "ft.com",
             "barrons.com",
+            "finance.yahoo.com",
+            "marketwatch.com",
+            "bloomberg.com",
+            "cnbc.com",
+            "apnews.com",
         ],
     },
     "semi": {
         "weight": 0.65,
         "domains": [
-            "finance.yahoo.com",
-            "marketwatch.com",
             "investorplace.com",
-            "fool.com",
+            "investing.com",
+            "news.yahoo.com",
+            "zacks.com",
+            "thestreet.com",
         ],
     },
     "low": {
         "weight": 0.2,
         "domains": [
+            "motleyfool.com",
             "seekingalpha.com",
             "medium.com",
             "substack.com",
+            "blogspot.com",
+            "reddit.com",
         ],
     },
 }
@@ -347,6 +356,13 @@ def build_query(
     if keyword_clause:
         query_parts.append(_wrap_clause(keyword_clause))
     return " AND ".join(part for part in query_parts if part)
+
+
+def build_simple_query(company: str, ticker: str) -> str:
+    company_clause = f'"{_escape_company(company)}"'
+    ticker_clause = ticker.upper()
+    cash_clause = f"${ticker_clause}"
+    return f"({company_clause} OR {ticker_clause} OR {cash_clause})"
 
 
 def _encoded_query_length(query: str) -> int:
@@ -502,6 +518,7 @@ def harvest(
     maxarticles: Optional[int] = None,
     sleep_between: float = 0.0,
     days_step: int = 30,
+    use_simple_query: bool = False,
 ) -> List[Dict[str, object]]:
     """Harvest articles for a list of (ticker, company_name)."""
     all_domains = sorted(
@@ -512,18 +529,21 @@ def harvest(
     content_cache: Dict[str, Optional[str]] = {}
 
     for ticker, company in companies:
-        domain_chunks = chunk_domains(company, ticker, all_domains)
-        query_plan: List[Tuple[List[str], List[str]]] = []
-        for domain_chunk in domain_chunks:
-            keyword_chunks = chunk_keywords(
-                company,
-                ticker,
-                domain_chunk,
-                KEYWORD_TERMS,
-                max_query_length=MAX_QUERY_LENGTH,
-            )
-            for keyword_chunk in keyword_chunks:
-                query_plan.append((domain_chunk, keyword_chunk))
+        if use_simple_query:
+            query_plan: List[Tuple[Optional[List[str]], Optional[List[str]]]] = [(None, None)]
+        else:
+            domain_chunks = chunk_domains(company, ticker, all_domains)
+            query_plan = []
+            for domain_chunk in domain_chunks:
+                keyword_chunks = chunk_keywords(
+                    company,
+                    ticker,
+                    domain_chunk,
+                    KEYWORD_TERMS,
+                    max_query_length=MAX_QUERY_LENGTH,
+                )
+                for keyword_chunk in keyword_chunks:
+                    query_plan.append((domain_chunk, keyword_chunk))
 
         total_queries = len(query_plan)
         ticker_start = len(rows)
@@ -533,12 +553,15 @@ def harvest(
         for idx, (domain_chunk, keyword_chunk) in enumerate(query_plan, start=1):
             if ticker_complete:
                 break
-            query = build_query(
-                company,
-                ticker,
-                domain_chunk,
-                keywords=keyword_chunk,
-            )
+            if use_simple_query:
+                query = build_simple_query(company, ticker)
+            else:
+                query = build_query(
+                    company,
+                    ticker,
+                    domain_chunk or [],
+                    keywords=keyword_chunk,
+                )
             logging.info(
                 "Querying GDELT for %s (%d/%d)", ticker, idx, total_queries
             )
@@ -548,7 +571,7 @@ def harvest(
                 idx,
                 total_queries,
                 query,
-                _encoded_query_length(query),
+                _encoded_query_length(query) if not use_simple_query else len(query),
             )
 
             end_dt: Optional[datetime] = None
@@ -701,6 +724,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maxarticles", type=int, default=None, help="Approximate max articles per ticker (fetches in batches)")
     parser.add_argument("--sleep", type=float, default=0.0, help="Seconds to sleep between API calls (helps avoid throttling)")
     parser.add_argument("--days-step", type=int, default=30, help="Days to step backwards when paginating")
+    parser.add_argument("--simple-query", action="store_true", help="Use a simplified company/ticker query (for rare tickers)")
     parser.add_argument("--shard-index", type=int, default=None, help="Zero-based shard index for parallel harvesting")
     parser.add_argument("--shard-count", type=int, default=None, help="Total number of shards for parallel harvesting")
     parser.add_argument("--log", default="INFO", help="Logging level")
@@ -731,6 +755,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         maxarticles=args.maxarticles,
         sleep_between=args.sleep,
         days_step=args.days_step,
+        use_simple_query=args.simple_query,
     )
     save_csv(rows, args.out)
     if rows:
